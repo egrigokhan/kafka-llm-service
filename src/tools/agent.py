@@ -230,6 +230,155 @@ class MCPConnection:
                 original_error=e
             )
     
+    async def call_tool_stream(
+        self, 
+        name: str, 
+        arguments: Dict[str, Any],
+        broadcast_pipe: Optional[str] = None
+    ) -> AsyncGenerator[str, None]:
+        """
+        Call a tool with streaming output via broadcast pipe.
+        
+        If broadcast_pipe is provided, reads streaming output from the pipe
+        while the tool executes. Otherwise falls back to non-streaming.
+        
+        Args:
+            name: Tool name
+            arguments: Tool arguments
+            broadcast_pipe: Path to named pipe for streaming output (e.g., /tmp/kafka_broadcaster_pipe)
+        
+        Yields:
+            Output chunks as they arrive
+        """
+        import os
+        
+        if not self._session:
+            raise ToolProviderError(
+                f"Not connected to MCP server: {self.config.name}",
+                tool_name=name
+            )
+        
+        # If no broadcast pipe or pipe doesn't exist, fall back to non-streaming
+        if not broadcast_pipe or not os.path.exists(broadcast_pipe):
+            result = await self.call_tool(name, arguments)
+            if result:
+                yield str(result)
+            return
+        
+        # Queue for streaming chunks
+        chunk_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        tool_done = asyncio.Event()
+        final_result: List[Any] = [None]
+        
+        async def read_pipe():
+            """Read from broadcast pipe and put chunks in queue."""
+            try:
+                # Open pipe for reading (non-blocking)
+                loop = asyncio.get_event_loop()
+                
+                # Use os.open with O_RDONLY | O_NONBLOCK
+                try:
+                    fd = os.open(broadcast_pipe, os.O_RDONLY | os.O_NONBLOCK)
+                except OSError:
+                    return  # Pipe doesn't exist or can't be opened
+                
+                try:
+                    buffer = ""
+                    while not tool_done.is_set():
+                        try:
+                            # Try to read from pipe
+                            data = os.read(fd, 4096)
+                            if data:
+                                buffer += data.decode('utf-8', errors='replace')
+                                
+                                # Process complete JSON messages (newline-delimited)
+                                while '\n' in buffer:
+                                    line, buffer = buffer.split('\n', 1)
+                                    if line.strip():
+                                        try:
+                                            msg = json.loads(line)
+                                            # Extract content from broadcast message
+                                            if msg.get("delta", {}).get("content"):
+                                                await chunk_queue.put(msg["delta"]["content"])
+                                            elif msg.get("output"):
+                                                # Done event - we'll get this from the tool result
+                                                pass
+                                        except json.JSONDecodeError:
+                                            pass
+                            else:
+                                # No data, wait a bit
+                                await asyncio.sleep(0.01)
+                        except BlockingIOError:
+                            await asyncio.sleep(0.01)
+                        except Exception:
+                            break
+                finally:
+                    os.close(fd)
+            except Exception:
+                pass
+            finally:
+                # Signal we're done reading
+                await chunk_queue.put(None)
+        
+        async def call_tool_task():
+            """Execute the tool call."""
+            try:
+                result = await self._session.call_tool(name, arguments)
+                
+                # Extract content
+                if hasattr(result, 'content') and result.content:
+                    contents = []
+                    for block in result.content:
+                        if hasattr(block, 'text'):
+                            contents.append(block.text)
+                        elif hasattr(block, 'data'):
+                            contents.append(block.data)
+                        else:
+                            contents.append(str(block))
+                    final_result[0] = "\n".join(contents) if contents else None
+                else:
+                    final_result[0] = result
+            except Exception as e:
+                final_result[0] = f"Error: {e}"
+            finally:
+                tool_done.set()
+        
+        # Start both tasks
+        pipe_task = asyncio.create_task(read_pipe())
+        tool_task = asyncio.create_task(call_tool_task())
+        
+        # Yield chunks as they arrive
+        chunks_received = False
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(chunk_queue.get(), timeout=0.1)
+                    if chunk is None:
+                        break
+                    chunks_received = True
+                    yield chunk
+                except asyncio.TimeoutError:
+                    if tool_done.is_set():
+                        # Drain any remaining chunks
+                        while not chunk_queue.empty():
+                            chunk = chunk_queue.get_nowait()
+                            if chunk is not None:
+                                chunks_received = True
+                                yield chunk
+                        break
+        finally:
+            tool_done.set()
+            pipe_task.cancel()
+            try:
+                await pipe_task
+            except asyncio.CancelledError:
+                pass
+            await tool_task
+        
+        # If no chunks were received via pipe, yield the final result
+        if not chunks_received and final_result[0]:
+            yield str(final_result[0])
+    
     async def disconnect(self) -> None:
         """Disconnect from the MCP server."""
         if self._session:
@@ -613,7 +762,7 @@ class AgentToolProvider(ToolProvider):
                 )
             
             else:
-                # MCP tools - non-streaming, yield as single chunk
+                # MCP tools - stream via broadcast pipe if available
                 connection = self._mcp_connections.get(source)
                 if connection is None:
                     yield ToolResultChunk(
@@ -624,11 +773,24 @@ class AgentToolProvider(ToolProvider):
                     )
                     return
                 
-                result = await connection.call_tool(name, arguments)
+                # Try streaming via broadcast pipe (used by notebook MCP server)
+                broadcast_pipe = "/tmp/kafka_broadcaster_pipe"
+                has_chunks = False
+                
+                async for chunk in connection.call_tool_stream(name, arguments, broadcast_pipe):
+                    has_chunks = True
+                    yield ToolResultChunk(
+                        tool_call_id=tool_call_id,
+                        tool_name=name,
+                        delta=chunk,
+                        is_complete=False
+                    )
+                
+                # Final chunk
                 yield ToolResultChunk(
                     tool_call_id=tool_call_id,
                     tool_name=name,
-                    delta=str(result) if result else "",
+                    delta="",
                     is_complete=True
                 )
                 

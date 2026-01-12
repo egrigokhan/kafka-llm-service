@@ -30,6 +30,7 @@ Environment Variables:
 """
 
 import os
+import uuid
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from supabase import create_client, Client
@@ -214,6 +215,7 @@ class SupabaseClient:
         
         # Build insert data - store message in "message" column
         data = {
+            "id": str(uuid.uuid4()),
             "thread_id": thread_id,
             "message": msg_obj,
         }
@@ -266,6 +268,7 @@ class SupabaseClient:
                 msg_obj["tool_call_id"] = message.tool_call_id
             
             row = {
+                "id": str(uuid.uuid4()),
                 "thread_id": thread_id,
                 "message": msg_obj,
             }
@@ -305,10 +308,10 @@ class SupabaseClient:
             ... )
             >>> print(f"Created thread: {thread['id']}")
         """
-        # Build thread data
-        data: Dict[str, Any] = {}
-        if thread_id:
-            data["id"] = thread_id
+        # Build thread data - always provide an id (table requires non-null)
+        data: Dict[str, Any] = {
+            "id": thread_id or str(uuid.uuid4())
+        }
         if metadata:
             data["metadata"] = metadata
         
@@ -392,3 +395,118 @@ class SupabaseClient:
         )
         
         return len(response.data) if response.data else 0
+
+    async def get_thread_sandbox_id(self, thread_id: str) -> Optional[str]:
+        """
+        Get the sandbox_id for a thread.
+        
+        Args:
+            thread_id: UUID of the thread
+        
+        Returns:
+            The sandbox_id if set, None otherwise
+        """
+        response = (
+            self.client
+            .table(self.threads_table)
+            .select("sandbox_id")
+            .eq("id", thread_id)
+            .execute()
+        )
+        
+        if response.data:
+            return response.data[0].get("sandbox_id")
+        return None
+    
+    async def update_thread_sandbox_id(
+        self,
+        thread_id: str,
+        sandbox_id: str
+    ) -> Dict[str, Any]:
+        """
+        Update the sandbox_id for a thread.
+        
+        Args:
+            thread_id: UUID of the thread
+            sandbox_id: The sandbox ID to associate with this thread
+        
+        Returns:
+            Dict containing the updated thread data
+        """
+        response = (
+            self.client
+            .table(self.threads_table)
+            .update({"sandbox_id": sandbox_id})
+            .eq("id", thread_id)
+            .execute()
+        )
+        
+        return response.data[0] if response.data else {}
+    
+    async def get_thread_config(self, thread_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get thread configuration data including related kafka_profile, profile, and vm_api_key.
+        
+        This fetches all the data needed for sandbox claim configuration:
+        - thread: user_id, kafka_profile_id, vm_api_key_id
+        - kafka_profiles: memory_dsn, user_id (to get profile)
+        - profiles: openai_pk_virtual_key (via kafka_profiles.user_id)
+        - vm_api_keys: api_key
+        
+        Args:
+            thread_id: UUID of the thread
+            
+        Returns:
+            Dict with thread config including:
+            - thread_id
+            - user_id
+            - kafka_profile_id
+            - memory_dsn (from kafka_profiles)
+            - openai_pk_virtual_key (from profiles)
+            - vm_api_key (from vm_api_keys)
+        """
+        # Step 1: Fetch thread with kafka_profiles and vm_api_keys
+        # Note: profiles is accessed via kafka_profiles.user_id, not directly from threads
+        response = (
+            self.client
+            .table(self.threads_table)
+            .select(
+                "id, user_id, kafka_profile_id, vm_api_key_id, "
+                "kafka_profiles!threads_kp_fkey(user_id, memory_dsn), "
+                "vm_api_keys!threads_vm_api_key_id_fkey(api_key)"
+            )
+            .eq("id", thread_id)
+            .execute()
+        )
+        
+        if not response.data:
+            return None
+        
+        row = response.data[0]
+        
+        # Extract nested data
+        kafka_profile = row.get("kafka_profiles") or {}
+        vm_api_key_data = row.get("vm_api_keys") or {}
+        
+        # Step 2: Get openai_pk_virtual_key from profiles via kafka_profile's user_id
+        openai_pk_virtual_key = None
+        kp_user_id = kafka_profile.get("user_id")
+        if kp_user_id:
+            profile_response = (
+                self.client
+                .table("profiles")
+                .select("openai_pk_virtual_key")
+                .eq("id", kp_user_id)
+                .execute()
+            )
+            if profile_response.data:
+                openai_pk_virtual_key = profile_response.data[0].get("openai_pk_virtual_key")
+        
+        return {
+            "thread_id": row.get("id"),
+            "user_id": row.get("user_id"),
+            "kafka_profile_id": row.get("kafka_profile_id"),
+            "memory_dsn": kafka_profile.get("memory_dsn"),
+            "openai_pk_virtual_key": openai_pk_virtual_key,
+            "vm_api_key": vm_api_key_data.get("api_key"),
+        }

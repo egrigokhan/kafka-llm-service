@@ -12,6 +12,7 @@ from .types import (
     ChatMessage,
     ChatCompletionRequest,
     AgentRunRequest,
+    CreateThreadRequest,
     DeltaContent,
     StreamChoice,
     StreamChunkResponse,

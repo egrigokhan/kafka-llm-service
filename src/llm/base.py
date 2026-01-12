@@ -20,7 +20,7 @@ from src.llm import PortkeyLLMProvider, Message
 provider = PortkeyLLMProvider(
     api_key="your-portkey-api-key",
     virtual_key="your-virtual-key",
-    model="gpt-4"
+    model="gpt-4o"
 )
 
 messages = [
@@ -91,7 +91,7 @@ class LLMProvider(ABC):
     Configuration:
     -------------
     Providers receive configuration through __init__. Common parameters:
-        - model: The model identifier (e.g., "gpt-4", "claude-3-opus")
+        - model: The model identifier (e.g., "gpt-4o", "claude-3-opus")
         - temperature: Sampling temperature (0.0 to 2.0)
         - max_tokens: Maximum tokens to generate
         - tool_provider: Optional ToolProvider for function calling

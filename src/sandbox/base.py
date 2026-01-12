@@ -91,6 +91,29 @@ class Sandbox(ABC):
         return self._metadata
     
     @abstractmethod
+    async def check_health(self) -> bool:
+        """
+        Quick health check to see if sandbox is alive.
+        
+        Unlike wait_until_live(), this does a single check with a short timeout.
+        
+        Returns:
+            True if sandbox is healthy, False otherwise.
+        """
+        pass
+    
+    @abstractmethod
+    async def get_health_status(self) -> Optional[Dict[str, Any]]:
+        """
+        Get full health status including claimed state.
+        
+        Returns:
+            Dict with health info including 'healthy' and 'claimed' fields,
+            or None if health check fails.
+        """
+        pass
+    
+    @abstractmethod
     async def wait_until_live(self, timeout: Optional[float] = None) -> None:
         """
         Wait until the sandbox is live and ready to accept commands.
@@ -168,6 +191,24 @@ class Sandbox(ABC):
         
         Returns:
             SandboxInfo: Current sandbox information.
+        """
+        pass
+    
+    @abstractmethod
+    async def claim(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Send a claim request to the sandbox.
+        
+        Posts the given data to the /claim endpoint on the sandbox.
+        
+        Args:
+            data: Dictionary of data to send in the claim request
+            
+        Returns:
+            Dict containing the response from the sandbox
+            
+        Raises:
+            SandboxError: If the claim request fails.
         """
         pass
     

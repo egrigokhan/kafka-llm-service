@@ -119,7 +119,7 @@ export default function ChatPlayground() {
           stream: true,
         };
       } else {
-        // Thread mode: auto-create thread if needed, send only new message
+        // Thread mode: auto-create thread if needed, send only new message via agent/run
         if (!currentThreadId) {
           const res = await fetch(`${API_BASE}/v1/threads`, {
             method: "POST",
@@ -130,7 +130,7 @@ export default function ChatPlayground() {
           currentThreadId = data.thread_id;
           setThreadId(currentThreadId);
         }
-        endpoint = `${API_BASE}/v1/threads/${currentThreadId}/chat/completions`;
+        endpoint = `${API_BASE}/v1/threads/${currentThreadId}/agent/run`;
         body = {
           model,
           messages: [newUserMsg].map((m) => {
@@ -138,7 +138,6 @@ export default function ChatPlayground() {
             if (m.content !== null) msg.content = m.content;
             return msg;
           }),
-          stream: true,
         };
       }
 
@@ -534,7 +533,7 @@ export default function ChatPlayground() {
         {mode === "agent"
           ? `${API_BASE}/v1/agent/run`
           : mode === "thread"
-          ? `${API_BASE}/v1/threads/<id>/chat/completions`
+          ? `${API_BASE}/v1/threads/<id>/agent/run`
           : `${API_BASE}/v1/chat/completions`}
       </div>
     </div>

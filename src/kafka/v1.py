@@ -9,11 +9,15 @@ import os
 from typing import Optional, List, Dict, Any, AsyncGenerator
 
 from src.llm import PortkeyLLMProvider, Message
-from src.db import SupabaseClient
+from src.db import SupabaseClient, LocalDBClient
 from src.tools import AgentToolProvider, Tool, SandboxTool
 from src.agents import Agent
+from src.prompts import PromptProviderV1, PromptProvider
 
 from .base import KafkaAgent
+
+# Type alias for any DB client that supports our interface
+DBClient = SupabaseClient | LocalDBClient
 
 
 class KafkaV1Provider(KafkaAgent):
@@ -25,6 +29,7 @@ class KafkaV1Provider(KafkaAgent):
     - Supabase thread storage
     - Local tools, MCP tools, and sandbox tools
     - Agentic loop with idle termination
+    - PromptProviderV1 for system prompt generation
     
     Usage:
         async with KafkaV1Provider(thread_id="my-thread") as kafka:
@@ -36,10 +41,9 @@ class KafkaV1Provider(KafkaAgent):
     """
     
     DEFAULT_SYSTEM_PROMPT = (
-        "You are a helpful assistant. IMPORTANT: You MUST always call the 'idle' "
-        "function when you are done responding. Even if you just want to say something "
-        "without using tools, you must still call 'idle' afterwards to signal completion. "
-        "Never end your turn without calling 'idle'."
+        "You are a helpful assistant. "
+        "When using tools, call the 'idle' function when you are done to signal completion. "
+        "For simple responses without tools, just respond naturally."
     )
     
     def __init__(
@@ -49,7 +53,12 @@ class KafkaV1Provider(KafkaAgent):
         sandbox_tools: Optional[List[SandboxTool]] = None,
         mcp_servers: Optional[List[Dict[str, Any]]] = None,
         system_prompt: Optional[str] = None,
-        default_model: Optional[str] = None
+        prompt_provider: Optional[PromptProvider] = None,
+        prompt_sections: Optional[List[str]] = None,
+        prompt_enrichment: Optional[Dict[str, Any]] = None,
+        default_model: Optional[str] = None,
+        db_client: Optional[DBClient] = None,
+        tool_provider: Optional[AgentToolProvider] = None
     ):
         """
         Initialize the Kafka V1 provider.
@@ -59,43 +68,68 @@ class KafkaV1Provider(KafkaAgent):
             tools: List of local Tool objects
             sandbox_tools: List of SandboxTool objects
             mcp_servers: List of MCP server configurations
-            system_prompt: Custom system prompt for the agent
+            system_prompt: Custom system prompt (overrides prompt_provider)
+            prompt_provider: Custom PromptProvider instance (overrides default)
+            prompt_sections: Sections to include in default prompt provider
+            prompt_enrichment: Additional enrichment data for prompt templates
             default_model: Default model to use
+            db_client: Database client for thread storage (LocalDBClient or SupabaseClient)
+            tool_provider: Optional shared tool provider (avoids MCP reconnection issues)
         """
         super().__init__(thread_id)
         
         self._tools = tools or []
         self._sandbox_tools = sandbox_tools or []
         self._mcp_servers = mcp_servers or []
-        self._system_prompt = system_prompt or self.DEFAULT_SYSTEM_PROMPT
+        self._system_prompt = system_prompt  # May be None - will use prompt_provider
+        self._external_prompt_provider = prompt_provider
+        self._prompt_sections = prompt_sections
+        self._prompt_enrichment = prompt_enrichment or {}
         self._default_model = default_model or os.environ.get("DEFAULT_MODEL", "gpt-4o")
+        self._external_db_client = db_client
+        self._shared_tool_provider = tool_provider
         
+        self._prompt_provider: Optional[PromptProvider] = None
         self._llm_provider: Optional[PortkeyLLMProvider] = None
+        self._owns_tool_provider = False  # Track if we own the tool provider (for cleanup)
     
     @property
     def llm_provider(self) -> Optional[PortkeyLLMProvider]:
         """Get the LLM provider."""
         return self._llm_provider
     
+    @property
+    def prompt_provider(self) -> Optional[PromptProvider]:
+        """Get the prompt provider."""
+        return self._prompt_provider
+    
     async def initialize(self) -> None:
         """
         Initialize the Kafka V1 provider.
         
-        Sets up database, tools, LLM provider, and agent.
+        Sets up database, tools, LLM provider, prompt provider, and agent.
         """
         if self._initialized:
             return
         
-        # Initialize database client
-        self._db_client = SupabaseClient()
+        # Use external db client if provided, otherwise create Supabase client
+        if self._external_db_client:
+            self._db_client = self._external_db_client
+        else:
+            self._db_client = SupabaseClient()
         
-        # Initialize tool provider
-        self._tool_provider = AgentToolProvider(
-            tools=self._tools,
-            mcp_servers=self._mcp_servers,
-            sandbox_tools=self._sandbox_tools
-        )
-        await self._tool_provider.connect()
+        # Use shared tool provider if provided, otherwise create new one
+        if self._shared_tool_provider:
+            self._tool_provider = self._shared_tool_provider
+            self._owns_tool_provider = False
+        else:
+            self._tool_provider = AgentToolProvider(
+                tools=self._tools,
+                mcp_servers=self._mcp_servers,
+                sandbox_tools=self._sandbox_tools
+            )
+            await self._tool_provider.connect()
+            self._owns_tool_provider = True
         
         # Initialize LLM provider with tools
         self._llm_provider = PortkeyLLMProvider(
@@ -103,11 +137,24 @@ class KafkaV1Provider(KafkaAgent):
             tool_provider=self._tool_provider
         )
         
-        # Initialize agent
+        # Initialize prompt provider
+        # Priority: external prompt_provider > system_prompt string > default PromptProviderV1
+        if self._external_prompt_provider:
+            self._prompt_provider = self._external_prompt_provider
+        elif self._system_prompt is None:
+            # Create default PromptProviderV1 with optional section filtering
+            self._prompt_provider = PromptProviderV1(sections=self._prompt_sections)
+            # Apply any additional enrichment
+            if self._prompt_enrichment:
+                self._prompt_provider.enrich(self._prompt_enrichment)
+        # If system_prompt is set, _prompt_provider stays None and we pass string directly
+        
+        # Initialize agent with prompt provider (or system prompt string as fallback)
         self._agent = Agent(
             llm_provider=self._llm_provider,
             tool_provider=self._tool_provider,
-            system_prompt=self._system_prompt
+            system_prompt=self._system_prompt,  # Takes precedence if set
+            prompt_provider=self._prompt_provider  # Used if system_prompt is None
         )
         
         self._initialized = True
@@ -121,7 +168,8 @@ class KafkaV1Provider(KafkaAgent):
         """
         Clean up resources.
         """
-        if self._tool_provider:
+        # Only disconnect tool provider if we own it (not shared)
+        if self._tool_provider and self._owns_tool_provider:
             await self._tool_provider.disconnect()
         
         if self._llm_provider:

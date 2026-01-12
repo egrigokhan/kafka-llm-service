@@ -2,7 +2,7 @@
 Local Sandbox implementation.
 
 Connects directly to a local or remote sandbox service via URL.
-The URL is the base endpoint for /health, /tool/run, etc.
+The URL is the base endpoint for /health, /run, etc.
 """
 
 import asyncio
@@ -27,7 +27,7 @@ class LocalSandbox(Sandbox):
     
     The sandbox service should expose:
     - GET /health - Health check endpoint
-    - POST /tool/run - Tool execution with streaming response
+    - POST /run - Tool execution with streaming response
     
     Usage:
         sandbox = LocalSandbox("http://localhost:8080")
@@ -68,6 +68,11 @@ class LocalSandbox(Sandbox):
         """Get the tool execution URL."""
         return f"{self._base_url}/run"
     
+    @property
+    def claim_url(self) -> str:
+        """Get the claim URL."""
+        return f"{self._base_url}/claim"
+    
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create the HTTP client."""
         if self._client is None or self._client.is_closed:
@@ -79,6 +84,43 @@ class LocalSandbox(Sandbox):
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
+    
+    async def check_health(self) -> bool:
+        """
+        Quick health check to see if sandbox is alive.
+        
+        Returns:
+            True if sandbox is healthy, False otherwise.
+        """
+        try:
+            client = await self._get_client()
+            response = await client.get(
+                self.health_url,
+                timeout=httpx.Timeout(5.0)
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
+    
+    async def get_health_status(self) -> Optional[Dict[str, Any]]:
+        """
+        Get full health status including claimed state.
+        
+        Returns:
+            Dict with health info including 'healthy' and 'claimed' fields,
+            or None if health check fails.
+        """
+        try:
+            client = await self._get_client()
+            response = await client.get(
+                self.health_url,
+                timeout=httpx.Timeout(5.0)
+            )
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception:
+            return None
     
     async def wait_until_live(self, timeout: Optional[float] = None) -> None:
         """
@@ -176,51 +218,60 @@ class LocalSandbox(Sandbox):
                         self._id
                     )
                 
-                # Parse SSE stream
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
+                # Parse SSE stream using byte chunks for real-time streaming
+                # aiter_lines() may buffer; aiter_bytes() gives us data as it arrives
+                buffer = ""
+                async for chunk in response.aiter_bytes():
+                    buffer += chunk.decode('utf-8', errors='replace')
                     
-                    if line.startswith("data: "):
-                        data_str = line[6:]
+                    # Process complete lines from buffer
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
                         
-                        if data_str == "[DONE]":
-                            yield ToolEvent(
-                                type="complete",
-                                data="",
-                                tool_name=tool_name,
-                                is_complete=True
-                            )
-                            return
+                        if not line:
+                            continue
                         
-                        try:
-                            data = json.loads(data_str)
+                        if line.startswith("data: "):
+                            data_str = line[6:]
                             
-                            event_type = data.get("type", "output")
-                            event_data = data.get("data", data.get("content", ""))
-                            is_complete = data.get("is_complete", False)
-                            exit_code = data.get("exit_code")
-                            metadata = data.get("metadata", {})
-                            
-                            yield ToolEvent(
-                                type=event_type,
-                                data=str(event_data),
-                                tool_name=tool_name,
-                                is_complete=is_complete,
-                                exit_code=exit_code,
-                                metadata=metadata
-                            )
-                            
-                            if is_complete:
+                            if data_str == "[DONE]":
+                                yield ToolEvent(
+                                    type="complete",
+                                    data="",
+                                    tool_name=tool_name,
+                                    is_complete=True
+                                )
                                 return
+                            
+                            try:
+                                data = json.loads(data_str)
                                 
-                        except json.JSONDecodeError:
-                            yield ToolEvent(
-                                type="output",
-                                data=data_str,
-                                tool_name=tool_name,
-                                is_complete=False
-                            )
+                                event_type = data.get("type", "output")
+                                event_data = data.get("data", data.get("content", ""))
+                                is_complete = data.get("is_complete", False)
+                                exit_code = data.get("exit_code")
+                                metadata = data.get("metadata", {})
+                                
+                                yield ToolEvent(
+                                    type=event_type,
+                                    data=str(event_data),
+                                    tool_name=tool_name,
+                                    is_complete=is_complete,
+                                    exit_code=exit_code,
+                                    metadata=metadata
+                                )
+                                
+                                if is_complete:
+                                    return
+                                    
+                            except json.JSONDecodeError:
+                                yield ToolEvent(
+                                    type="output",
+                                    data=data_str,
+                                    tool_name=tool_name,
+                                    is_complete=False
+                                )
                         
         except httpx.ConnectError as e:
             raise SandboxError(f"Failed to connect to sandbox: {e}", self._id)
@@ -255,6 +306,47 @@ class LocalSandbox(Sandbox):
             url=self._base_url,
             metadata=self._metadata
         )
+    
+    async def claim(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Send a claim request to the sandbox.
+        
+        Posts the given data to the /claim endpoint.
+        
+        Args:
+            data: Dictionary of data to send in the claim request
+            
+        Returns:
+            Dict containing the response from the sandbox
+            
+        Raises:
+            SandboxError: If the claim request fails.
+        """
+        client = await self._get_client()
+        
+        try:
+            response = await client.post(
+                self.claim_url,
+                json=data,
+                timeout=httpx.Timeout(30.0)
+            )
+            
+            if response.status_code != 200:
+                raise SandboxError(
+                    f"Claim request failed with status {response.status_code}: {response.text}",
+                    self._id
+                )
+            
+            return response.json()
+            
+        except httpx.ConnectError as e:
+            raise SandboxError(f"Failed to connect to sandbox for claim: {e}", self._id)
+        except httpx.TimeoutException as e:
+            raise SandboxError(f"Claim request timed out: {e}", self._id)
+        except Exception as e:
+            if isinstance(e, SandboxError):
+                raise
+            raise SandboxError(f"Claim request error: {e}", self._id)
     
     @staticmethod
     async def create(

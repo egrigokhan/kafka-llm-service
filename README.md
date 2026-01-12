@@ -36,7 +36,7 @@ CREATE TABLE threads (
     metadata JSONB
 );
 
--- Messages table  
+-- Messages table
 CREATE TABLE messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     thread_id UUID REFERENCES threads(id) ON DELETE CASCADE,
@@ -90,7 +90,7 @@ client = OpenAI(
 
 # Streaming
 stream = client.chat.completions.create(
-    model="gpt-4",
+    model="gpt-4o",
     messages=[{"role": "user", "content": "Hello!"}],
     stream=True
 )
@@ -100,7 +100,7 @@ for chunk in stream:
 
 # Non-streaming
 response = client.chat.completions.create(
-    model="gpt-4", 
+    model="gpt-4o",
     messages=[{"role": "user", "content": "What did I just say?"}]
 )
 print(response.choices[0].message.content)
@@ -118,7 +118,7 @@ curl -X POST http://localhost:8000/v1/threads \
 curl -X POST http://localhost:8000/v1/threads/YOUR_THREAD_ID/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4",
+    "model": "gpt-4o",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
   }'
@@ -129,15 +129,15 @@ curl http://localhost:8000/v1/threads/YOUR_THREAD_ID/messages
 
 ## API Endpoints
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/v1/threads/{id}/chat/completions` | Chat completion (main endpoint) |
-| GET | `/v1/threads/{id}/messages` | Get all messages in thread |
-| POST | `/v1/threads/{id}/messages` | Add message without completion |
-| POST | `/v1/threads` | Create new thread |
-| DELETE | `/v1/threads/{id}/messages` | Clear thread messages |
-| GET | `/v1/models` | List available models |
-| GET | `/health` | Health check |
+| Method | Endpoint                            | Description                     |
+| ------ | ----------------------------------- | ------------------------------- |
+| POST   | `/v1/threads/{id}/chat/completions` | Chat completion (main endpoint) |
+| GET    | `/v1/threads/{id}/messages`         | Get all messages in thread      |
+| POST   | `/v1/threads/{id}/messages`         | Add message without completion  |
+| POST   | `/v1/threads`                       | Create new thread               |
+| DELETE | `/v1/threads/{id}/messages`         | Clear thread messages           |
+| GET    | `/v1/models`                        | List available models           |
+| GET    | `/health`                           | Health check                    |
 
 ## Project Structure
 
@@ -181,7 +181,7 @@ class MyCustomProvider(LLMProvider):
         # Your streaming implementation
         async for token in my_api.stream(messages):
             yield StreamChunk(delta=token)
-    
+
     async def completion(self, messages, **kwargs):
         # Your non-streaming implementation
         result = await my_api.complete(messages)
@@ -192,23 +192,25 @@ See `src/llm/base.py` for the full interface documentation.
 
 ## Configuration Options
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `PORTKEY_API_KEY` | Portkey API key | Required |
-| `PORTKEY_VIRTUAL_KEY` | Virtual key for LLM provider | Required |
-| `SUPABASE_URL` | Supabase project URL | Required |
-| `SUPABASE_KEY` | Supabase API key | Required |
-| `DEFAULT_MODEL` | Default model when not specified | `gpt-4` |
-| `PORT` | Server port | `8000` |
+| Variable              | Description                      | Default  |
+| --------------------- | -------------------------------- | -------- |
+| `PORTKEY_API_KEY`     | Portkey API key                  | Required |
+| `PORTKEY_VIRTUAL_KEY` | Virtual key for LLM provider     | Required |
+| `SUPABASE_URL`        | Supabase project URL             | Required |
+| `SUPABASE_KEY`        | Supabase API key                 | Required |
+| `DEFAULT_MODEL`       | Default model when not specified | `gpt-4`  |
+| `PORT`                | Server port                      | `8000`   |
 
 ## Why Threads?
 
 **Traditional approach:**
+
 - Client sends ALL messages every request
 - Token costs scale with conversation length
 - Client must manage conversation state
 
 **Thread-based approach:**
+
 - Client sends only NEW message(s)
 - Server manages history efficiently
 - Simpler client implementation

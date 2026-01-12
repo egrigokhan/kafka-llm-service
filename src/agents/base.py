@@ -38,10 +38,15 @@ import uuid
 import time
 from typing import Optional, List, Dict, Any, AsyncGenerator
 
+from typing import TYPE_CHECKING
+
 from src.llm.base import LLMProvider
 from src.llm.types import Message
 from src.tools.base import ToolProvider
 from src.tools.types import Tool
+
+if TYPE_CHECKING:
+    from src.prompts.base import PromptProvider
 
 
 class Agent:
@@ -66,6 +71,7 @@ class Agent:
         llm_provider: LLMProvider,
         tool_provider: ToolProvider,
         system_prompt: Optional[str] = None,
+        prompt_provider: Optional["PromptProvider"] = None,
         max_iterations: int = 50
     ):
         """
@@ -74,13 +80,24 @@ class Agent:
         Args:
             llm_provider: LLM provider for generating responses
             tool_provider: Tool provider for executing tools
-            system_prompt: Optional system prompt
+            system_prompt: Optional system prompt (overrides prompt_provider)
+            prompt_provider: Optional PromptProvider for system prompt generation.
+                           If both system_prompt and prompt_provider are given,
+                           system_prompt takes precedence.
             max_iterations: Safety limit for loop iterations
         """
         self.llm_provider = llm_provider
         self.tool_provider = tool_provider
-        self.system_prompt = system_prompt
+        self.prompt_provider = prompt_provider
         self.max_iterations = max_iterations
+        
+        # Resolve system prompt: explicit string takes precedence over provider
+        if system_prompt is not None:
+            self.system_prompt = system_prompt
+        elif prompt_provider is not None:
+            self.system_prompt = prompt_provider.get_system_prompt()
+        else:
+            self.system_prompt = None
         
         # Add the idle tool internally
         self._add_idle_tool()
@@ -89,7 +106,7 @@ class Agent:
         """Add the idle tool that signals the agent loop should stop."""
         idle_tool = Tool(
             name="idle",
-            description="REQUIRED: You MUST call this function after every response to signal you are done. Call it after responding to the user, after completing tasks, or after any message. Never end your turn without calling idle.",
+            description="Call this after using tools to signal you are done with your task. Only needed after tool usage, not for simple text responses.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -164,6 +181,7 @@ class Agent:
             # Stream the LLM completion
             async for chunk in self.llm_provider.stream_completion(
                 working_messages,
+                model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 **kwargs
@@ -239,18 +257,16 @@ class Agent:
             # Convert accumulated tool calls to list
             tool_calls = [accumulated_tool_calls[i] for i in sorted(accumulated_tool_calls.keys())]
             
-            # If no tool calls, the LLM responded with text but didn't call idle
-            # Add the response to messages and continue the loop - the LLM must call idle
+            # If no tool calls, the LLM responded with just text - we're done
             if not tool_calls:
-                # Add assistant message with just content
-                working_messages.append(Message(
-                    role="assistant",
-                    content=full_content if full_content else None
-                ))
-                
-                # Reset for next iteration and continue the loop
-                streamContentRef = ""
-                continue
+                # Yield agent done with the text content
+                yield {
+                    "type": "agent_done",
+                    "reason": "text_response",
+                    "final_content": full_content,
+                    "iteration": iteration
+                }
+                return
             
             # Add assistant message with tool calls to context
             working_messages.append(Message(
@@ -301,45 +317,18 @@ class Agent:
                     }
                     return
                 
-                # Get the tool
-                tool = self.tool_provider.get_tool(tool_name)
+                # Execute the tool with streaming
                 result_content = ""
                 
-                # Execute the tool with streaming if supported
-                if tool and tool.is_streaming:
-                    async for chunk in tool.run_stream(tool_args):
-                        result_content += chunk
-                        yield {
-                            "type": "tool_result",
-                            "tool_call_id": tool_call_id,
-                            "tool_name": tool_name,
-                            "delta": chunk,
-                            "is_complete": False
-                        }
-                    
-                    # Final chunk for this tool
+                # Use streaming execution for all tools
+                async for chunk in self.tool_provider.run_tool_stream(tool_name, tool_args, tool_call_id):
+                    result_content += chunk.delta
                     yield {
                         "type": "tool_result",
                         "tool_call_id": tool_call_id,
                         "tool_name": tool_name,
-                        "delta": "",
-                        "is_complete": True
-                    }
-                else:
-                    # Non-streaming tool execution
-                    result = await self.tool_provider.run_tool(tool_name, tool_args)
-                    if result.success:
-                        result_content = str(result.result)
-                    else:
-                        result_content = f"Error: {result.error}"
-                    
-                    # Yield complete result in one chunk
-                    yield {
-                        "type": "tool_result",
-                        "tool_call_id": tool_call_id,
-                        "tool_name": tool_name,
-                        "delta": result_content,
-                        "is_complete": True
+                        "delta": chunk.delta,
+                        "is_complete": chunk.is_complete
                     }
                 
                 # Add tool result to messages

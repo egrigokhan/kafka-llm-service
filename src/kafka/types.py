@@ -46,6 +46,14 @@ class AgentRunRequest(BaseModel):
     max_tokens: Optional[int] = None
 
 
+class CreateThreadRequest(BaseModel):
+    """Request for creating a new thread."""
+    system_message: Optional[str] = Field(None, description="Optional system message to start thread with")
+    user_id: Optional[str] = Field(None, description="User ID for this thread")
+    kafka_profile_id: Optional[str] = Field(None, description="Kafka profile ID for this thread")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata")
+
+
 class DeltaContent(BaseModel):
     """Delta object in streaming response."""
     role: Optional[str] = None

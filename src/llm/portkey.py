@@ -26,7 +26,7 @@ Example:
 provider = PortkeyLLMProvider(
     api_key="pk-xxx",
     virtual_key="openai-xxx",
-    model="gpt-4"
+    model="gpt-4o"
 )
 
 messages = [Message(role="user", content="Hello!")]
@@ -70,7 +70,7 @@ class PortkeyLLMProvider(LLMProvider):
         >>> provider = PortkeyLLMProvider(
         ...     api_key=os.environ["PORTKEY_API_KEY"],
         ...     virtual_key=os.environ["PORTKEY_VIRTUAL_KEY"],
-        ...     model="gpt-4"
+        ...     model="gpt-4o"
         ... )
         >>> 
         >>> messages = [Message(role="user", content="Hi!")]
@@ -82,7 +82,7 @@ class PortkeyLLMProvider(LLMProvider):
         self,
         api_key: Optional[str] = None,
         virtual_key: Optional[str] = None,
-        model: str = "gpt-4",
+        model: str = "gpt-4o",
         default_temperature: float = 0.7,
         default_max_tokens: Optional[int] = None,
         tool_provider: Optional["ToolProvider"] = None,
@@ -95,7 +95,7 @@ class PortkeyLLMProvider(LLMProvider):
             api_key: Portkey API key. Falls back to PORTKEY_API_KEY env var.
             virtual_key: Portkey virtual key for the LLM provider.
                         Falls back to PORTKEY_VIRTUAL_KEY env var.
-            model: Model identifier (e.g., "gpt-4", "claude-3-opus-20240229").
+            model: Model identifier (e.g., "gpt-4o", "claude-3-opus-20240229").
                   Must be valid for the provider behind the virtual key.
             default_temperature: Default sampling temperature (0.0-2.0).
             default_max_tokens: Default max tokens. None = provider default.

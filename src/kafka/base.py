@@ -10,9 +10,12 @@ from abc import ABC, abstractmethod
 from typing import Optional, List, Dict, Any, AsyncGenerator, Union
 
 from src.llm import Message, CompletionResponse
-from src.db import SupabaseClient
+from src.db import SupabaseClient, LocalDBClient
 from src.tools import AgentToolProvider, ToolResultChunk
 from src.agents import Agent
+
+# Type alias for any DB client that supports our interface
+DBClient = SupabaseClient | LocalDBClient
 
 from .types import ChatCompletionRequest, AgentRunRequest
 from .utils import sanitize_messages_for_openai
@@ -39,7 +42,7 @@ class KafkaAgent(ABC):
                       If None, operates in stateless mode.
         """
         self._thread_id = thread_id
-        self._db_client: Optional[SupabaseClient] = None
+        self._db_client: Optional[DBClient] = None
         self._tool_provider: Optional[AgentToolProvider] = None
         self._agent: Optional[Agent] = None
         self._initialized = False
@@ -209,6 +212,11 @@ class KafkaAgent(ABC):
         messages_to_save: List[Message] = []
         final_content = ""
         
+        # Accumulate streaming content
+        current_assistant_content = ""
+        current_tool_calls: Dict[int, Dict[str, Any]] = {}
+        accumulated_tool_results: Dict[str, str] = {}  # tool_call_id -> accumulated content
+        
         # Run the agent
         async for event in self.run(
             messages=all_messages,
@@ -220,21 +228,70 @@ class KafkaAgent(ABC):
             
             # Track messages for saving
             if save_to_thread:
-                if event.get("type") == "assistant_message":
-                    msg_data = event.get("message", {})
-                    if msg_data:
+                # Handle tool result streaming - accumulate delta, save on complete
+                if event.get("type") == "tool_result":
+                    tool_call_id = event.get("tool_call_id", "")
+                    delta = event.get("delta", "")
+                    is_complete = event.get("is_complete", False)
+                    
+                    # Accumulate content
+                    if tool_call_id not in accumulated_tool_results:
+                        accumulated_tool_results[tool_call_id] = ""
+                    accumulated_tool_results[tool_call_id] += delta
+                    
+                    # Save when complete
+                    if is_complete:
                         messages_to_save.append(Message(
-                            role=msg_data.get("role", "assistant"),
-                            content=msg_data.get("content"),
-                            tool_calls=msg_data.get("tool_calls")
+                            role="tool",
+                            content=accumulated_tool_results[tool_call_id],
+                            tool_call_id=tool_call_id,
+                            name=event.get("tool_name")
                         ))
-                elif event.get("type") == "tool_result":
-                    messages_to_save.append(Message(
-                        role="tool",
-                        content=event.get("content", ""),
-                        tool_call_id=event.get("tool_call_id"),
-                        name=event.get("tool_name")
-                    ))
+                
+                # Handle OpenAI format chunks - accumulate content and tool_calls
+                elif event.get("choices"):
+                    choice = event["choices"][0]
+                    delta = choice.get("delta", {})
+                    finish_reason = choice.get("finish_reason")
+                    
+                    # Accumulate content
+                    if delta.get("content"):
+                        current_assistant_content += delta["content"]
+                    
+                    # Accumulate tool calls
+                    if delta.get("tool_calls"):
+                        for tc in delta["tool_calls"]:
+                            idx = tc.get("index", 0)
+                            if idx not in current_tool_calls:
+                                current_tool_calls[idx] = {
+                                    "id": "", "type": "function",
+                                    "function": {"name": "", "arguments": ""}
+                                }
+                            if tc.get("id"):
+                                current_tool_calls[idx]["id"] = tc["id"]
+                            if tc.get("function", {}).get("name"):
+                                current_tool_calls[idx]["function"]["name"] = tc["function"]["name"]
+                            if tc.get("function", {}).get("arguments"):
+                                current_tool_calls[idx]["function"]["arguments"] += tc["function"]["arguments"]
+                    
+                    # When LLM turn ends, save assistant message
+                    if finish_reason == "tool_calls":
+                        tool_calls_list = [current_tool_calls[i] for i in sorted(current_tool_calls.keys())]
+                        messages_to_save.append(Message(
+                            role="assistant",
+                            content=current_assistant_content if current_assistant_content else None,
+                            tool_calls=tool_calls_list
+                        ))
+                        # Reset for next iteration
+                        current_assistant_content = ""
+                        current_tool_calls = {}
+                    elif finish_reason == "stop" and current_assistant_content:
+                        messages_to_save.append(Message(
+                            role="assistant",
+                            content=current_assistant_content
+                        ))
+                        current_assistant_content = ""
+                
                 elif event.get("type") == "agent_done":
                     final_content = event.get("final_content", "")
         
