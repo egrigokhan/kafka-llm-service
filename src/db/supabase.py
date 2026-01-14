@@ -31,7 +31,7 @@ Environment Variables:
 
 import os
 import uuid
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from supabase import create_client, Client
 
@@ -288,7 +288,9 @@ class SupabaseClient:
         self,
         thread_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
-        system_message: Optional[str] = None
+        system_message: Optional[str] = None,
+        user_id: Optional[str] = None,
+        kafka_profile_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Create a new thread.
@@ -296,8 +298,10 @@ class SupabaseClient:
         Args:
             thread_id: Optional specific UUID for the thread.
                       If not provided, Supabase will generate one.
-            metadata: Optional metadata to store with the thread
+            metadata: Optional metadata to store with the thread (if table supports it)
             system_message: Optional system message to initialize the thread with
+            user_id: Optional user ID to associate with the thread
+            kafka_profile_id: Optional kafka profile ID to associate with the thread
         
         Returns:
             Dict containing the created thread data (id, created_at, etc.)
@@ -312,8 +316,16 @@ class SupabaseClient:
         data: Dict[str, Any] = {
             "id": thread_id or str(uuid.uuid4())
         }
-        if metadata:
-            data["metadata"] = metadata
+        
+        # Add user_id and kafka_profile_id as direct columns (not in metadata)
+        if user_id:
+            data["user_id"] = user_id
+        if kafka_profile_id:
+            data["kafka_profile_id"] = kafka_profile_id
+        
+        # Note: metadata column may not exist in all thread table schemas
+        # Only include if explicitly provided and non-empty
+        # If you need metadata support, ensure the column exists in Supabase
         
         # Insert thread
         response = (
@@ -447,10 +459,10 @@ class SupabaseClient:
         """
         Get thread configuration data including related kafka_profile, profile, and vm_api_key.
         
-        This fetches all the data needed for sandbox claim configuration:
+        This fetches all the data needed for sandbox claim configuration and LLM provider:
         - thread: user_id, kafka_profile_id, vm_api_key_id
-        - kafka_profiles: memory_dsn, user_id (to get profile)
-        - profiles: openai_pk_virtual_key (via kafka_profiles.user_id)
+        - kafka_profiles: memory_dsn, user_id (to get profile), global_prompt
+        - profiles: provider-specific virtual keys (via kafka_profiles.user_id)
         - vm_api_keys: api_key
         
         Args:
@@ -462,7 +474,11 @@ class SupabaseClient:
             - user_id
             - kafka_profile_id
             - memory_dsn (from kafka_profiles)
-            - openai_pk_virtual_key (from profiles)
+            - global_prompt (from kafka_profiles)
+            - openai_pk_virtual_key (from profiles) - OpenAI virtual key
+            - anthropic_pk_virtual_key (from profiles) - Anthropic virtual key
+            - gemini_pk_virtual_key (from profiles) - Gemini virtual key
+            - bedrock_pk_virtual_key (from profiles) - Bedrock virtual key
             - vm_api_key (from vm_api_keys)
         """
         # Step 1: Fetch thread with kafka_profiles and vm_api_keys
@@ -472,7 +488,7 @@ class SupabaseClient:
             .table(self.threads_table)
             .select(
                 "id, user_id, kafka_profile_id, vm_api_key_id, "
-                "kafka_profiles!threads_kp_fkey(user_id, memory_dsn), "
+                "kafka_profiles!threads_kp_fkey(user_id, memory_dsn, global_prompt), "
                 "vm_api_keys!threads_vm_api_key_id_fkey(api_key)"
             )
             .eq("id", thread_id)
@@ -488,25 +504,204 @@ class SupabaseClient:
         kafka_profile = row.get("kafka_profiles") or {}
         vm_api_key_data = row.get("vm_api_keys") or {}
         
-        # Step 2: Get openai_pk_virtual_key from profiles via kafka_profile's user_id
+        # Step 2: Get provider-specific virtual keys from profiles via kafka_profile's user_id
+        # Profiles has separate virtual keys for each provider: openai, anthropic, gemini, bedrock
         openai_pk_virtual_key = None
+        anthropic_pk_virtual_key = None
+        gemini_pk_virtual_key = None
+        bedrock_pk_virtual_key = None
         kp_user_id = kafka_profile.get("user_id")
         if kp_user_id:
             profile_response = (
                 self.client
                 .table("profiles")
-                .select("openai_pk_virtual_key")
+                .select("openai_pk_virtual_key, anthropic_pk_virtual_key, gemini_pk_virtual_key, bedrock_pk_virtual_key")
                 .eq("id", kp_user_id)
                 .execute()
             )
             if profile_response.data:
-                openai_pk_virtual_key = profile_response.data[0].get("openai_pk_virtual_key")
+                profile_data = profile_response.data[0]
+                openai_pk_virtual_key = profile_data.get("openai_pk_virtual_key")
+                anthropic_pk_virtual_key = profile_data.get("anthropic_pk_virtual_key")
+                gemini_pk_virtual_key = profile_data.get("gemini_pk_virtual_key")
+                bedrock_pk_virtual_key = profile_data.get("bedrock_pk_virtual_key")
         
         return {
             "thread_id": row.get("id"),
             "user_id": row.get("user_id"),
             "kafka_profile_id": row.get("kafka_profile_id"),
             "memory_dsn": kafka_profile.get("memory_dsn"),
+            "global_prompt": kafka_profile.get("global_prompt"),
+            # Provider-specific virtual keys
             "openai_pk_virtual_key": openai_pk_virtual_key,
+            "anthropic_pk_virtual_key": anthropic_pk_virtual_key,
+            "gemini_pk_virtual_key": gemini_pk_virtual_key,
+            "bedrock_pk_virtual_key": bedrock_pk_virtual_key,
             "vm_api_key": vm_api_key_data.get("api_key"),
         }
+    
+    async def get_or_create_vm_api_key(
+        self, 
+        thread_id: str, 
+        user_id: str, 
+        kafka_profile_id: Optional[str] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Get existing VM API key or create a new one for the thread.
+        
+        The VM API key is created when making the sandbox, so this method
+        checks for an existing active key first, and creates one if needed.
+        
+        Args:
+            thread_id: The thread ID
+            user_id: The user ID (for team threads, should be team owner's user_id)
+            kafka_profile_id: Optional kafka profile ID
+            
+        Returns:
+            Tuple of (vm_api_key, vm_api_key_id) or (None, None) if creation fails
+        """
+        if not thread_id or not user_id:
+            # Fallback to generated key for local dev
+            return f"vm_{str(uuid.uuid4())}", None
+        
+        try:
+            # Check for existing active key
+            response = (
+                self.client
+                .table("vm_api_keys")
+                .select("*")
+                .eq("thread_id", thread_id)
+                .eq("status", "active")
+                .execute()
+            )
+            
+            if response.data and len(response.data) > 0:
+                # Return existing key
+                return response.data[0]["api_key"], response.data[0]["id"]
+            
+            # No existing key, create a new one
+            return await self._create_vm_api_key(thread_id, user_id, kafka_profile_id)
+        except Exception as e:
+            print(f"⚠️ Error getting/creating VM API key: {e}")
+            # Fallback to generated key
+            return f"vm_{str(uuid.uuid4())}", None
+    
+    async def _create_vm_api_key(
+        self,
+        thread_id: str,
+        user_id: str,
+        kafka_profile_id: Optional[str] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Create a new VM API key for the thread.
+        
+        Args:
+            thread_id: The thread ID
+            user_id: The user ID
+            kafka_profile_id: Optional kafka profile ID
+            
+        Returns:
+            Tuple of (vm_api_key, vm_api_key_id) or (None, None) if creation fails
+        """
+        try:
+            # Get thread data to extract team_id if needed
+            thread_response = (
+                self.client
+                .table(self.threads_table)
+                .select("team_id, kafka_profile_id")
+                .eq("id", thread_id)
+                .execute()
+            )
+            
+            thread_data = thread_response.data[0] if thread_response.data else {}
+            team_id = thread_data.get("team_id")
+            
+            # Use kafka_profile_id from thread if not provided
+            if not kafka_profile_id:
+                kafka_profile_id = thread_data.get("kafka_profile_id")
+            
+            # If thread has a team, get team owner's user_id
+            api_key_owner_id = user_id
+            if team_id:
+                team_response = (
+                    self.client
+                    .table("teams")
+                    .select("created_by")
+                    .eq("id", team_id)
+                    .single()
+                    .execute()
+                )
+                if team_response.data:
+                    api_key_owner_id = team_response.data["created_by"]
+            
+            # Generate VM API key using database function
+            key_response = self.client.rpc("generate_vm_api_key").execute()
+            vm_api_key = key_response.data if key_response.data else f"vm_{str(uuid.uuid4())}"
+            
+            # Generate UUID for the new key
+            key_id = str(uuid.uuid4())
+            
+            # Insert new API key
+            insert_data = {
+                "id": key_id,
+                "thread_id": thread_id,
+                "user_id": api_key_owner_id,
+                "api_key": vm_api_key,
+                "status": "active"
+            }
+            
+            if team_id:
+                insert_data["team_id"] = team_id
+            
+            if kafka_profile_id:
+                insert_data["kafka_profile_id"] = kafka_profile_id
+            
+            # Insert the key
+            insert_response = (
+                self.client
+                .table("vm_api_keys")
+                .insert(insert_data)
+                .execute()
+            )
+            
+            if insert_response.data:
+                # Update thread with vm_api_key_id
+                self.client.table(self.threads_table).update({
+                    "vm_api_key_id": key_id
+                }).eq("id", thread_id).execute()
+                
+                return vm_api_key, key_id
+            
+            return None, None
+        except Exception as e:
+            print(f"⚠️ Error creating VM API key: {e}")
+            # Fallback to generated key
+            return f"vm_{str(uuid.uuid4())}", None
+    
+    async def get_playbooks_for_kafka_profile(
+        self,
+        kafka_profile_id: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all playbooks for a kafka profile.
+        
+        Args:
+            kafka_profile_id: UUID of the kafka profile
+            
+        Returns:
+            List of playbook dicts with id, name, and description
+        """
+        try:
+            response = (
+                self.client
+                .table("playbooks")
+                .select("id, name, description")
+                .eq("kafka_profile_id", kafka_profile_id)
+                .order("created_at", desc=False)
+                .execute()
+            )
+            
+            return response.data or []
+        except Exception as e:
+            print(f"⚠️ Error fetching playbooks: {e}")
+            return []

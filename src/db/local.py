@@ -10,7 +10,7 @@ import os
 import json
 import uuid
 import aiosqlite
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 from pathlib import Path
 
@@ -328,7 +328,7 @@ class LocalDBClient:
             await db.commit()
         
         return {"id": thread_id, "sandbox_id": sandbox_id}
-    
+
     async def get_thread_config(self, thread_id: str) -> Optional[Dict[str, Any]]:
         """
         Get thread configuration data for sandbox claim.
@@ -345,3 +345,26 @@ class LocalDBClient:
             None - local DB doesn't have related config data
         """
         return None
+    
+    async def get_or_create_vm_api_key(
+        self, 
+        thread_id: str, 
+        user_id: str, 
+        kafka_profile_id: Optional[str] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Get or create VM API key for local development.
+        
+        For LocalDBClient, this generates a simple key for local dev.
+        In production, SupabaseClient creates real keys in the database.
+        
+        Args:
+            thread_id: The thread ID
+            user_id: The user ID
+            kafka_profile_id: Optional kafka profile ID (ignored in local)
+            
+        Returns:
+            Tuple of (vm_api_key, None) - local dev doesn't track key IDs
+        """
+        # For local dev, generate a simple key
+        return f"vm_{str(uuid.uuid4())}", None

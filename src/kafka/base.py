@@ -273,6 +273,9 @@ class KafkaAgent(ABC):
                                 current_tool_calls[idx]["function"]["name"] = tc["function"]["name"]
                             if tc.get("function", {}).get("arguments"):
                                 current_tool_calls[idx]["function"]["arguments"] += tc["function"]["arguments"]
+                            # Preserve thought_signature for Gemini (required for multi-turn tool calling)
+                            if tc.get("function", {}).get("thought_signature"):
+                                current_tool_calls[idx]["function"]["thought_signature"] = tc["function"]["thought_signature"]
                     
                     # When LLM turn ends, save assistant message
                     if finish_reason == "tool_calls":

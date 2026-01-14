@@ -10,6 +10,7 @@ from .types import SandboxConfig, SandboxInfo, ToolEvent
 from .daytona import DaytonaSandbox
 from .local import LocalSandbox
 from .manager import SandboxManager
+from .lazy import LazySandbox
 
 __all__ = [
     "Sandbox",
@@ -21,4 +22,5 @@ __all__ = [
     "DaytonaSandbox",
     "LocalSandbox",
     "SandboxManager",
+    "LazySandbox",
 ]

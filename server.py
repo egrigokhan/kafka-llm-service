@@ -49,7 +49,7 @@ from src.kafka import (
     convert_to_internal_message,
     sanitize_messages_for_openai,
 )
-from src.sandbox import LocalSandbox, SandboxManager, DaytonaSandbox
+from src.sandbox import LocalSandbox, SandboxManager, DaytonaSandbox, LazySandbox
 from src.warm_sandbox.daytona import DaytonaWarmSandboxFactory
 
 # Import server tools
@@ -220,11 +220,13 @@ async def generate_agent_stream_with_thread(
         if thread_sandbox:
             print(f"✅ Sandbox ready for thread {thread_id}")
         else:
-            # Kick off background creation - sandbox tools will wait when called
+            # Kick off background creation
             print(f"⏳ No sandbox ready for thread {thread_id}, starting background setup")
             sandbox_manager.ensure_sandbox_background(thread_id=thread_id)
-            # Get a sandbox reference for tools (they have built-in waits)
-            thread_sandbox = await sandbox_manager.get_or_create_sandbox_ref(thread_id)
+            # Use LazySandbox - it will wait for real sandbox only when a tool is called
+            # This allows the LLM to start streaming immediately
+            thread_sandbox = LazySandbox(thread_id, sandbox_manager, timeout=120.0)
+            print(f"📦 Using LazySandbox for thread {thread_id} (tools will wait when called)")
         
         # Sandbox tools always included - they have built-in health waits
         thread_shell_tools = ShellTools(thread_sandbox, health_timeout=30)
@@ -560,27 +562,25 @@ async def create_thread(request: Optional[CreateThreadRequest] = None):
     - system_message: Optional starting system message
     - user_id: User ID for sandbox claiming
     - kafka_profile_id: Kafka profile ID for sandbox claiming
-    - metadata: Additional metadata
+    - metadata: Additional metadata (not currently stored)
     """
     if not thread_db:
         raise HTTPException(status_code=503, detail="Server not initialized")
     
-    # Build metadata with user_id and kafka_profile_id if provided
-    metadata: Dict[str, Any] = {}
+    # Extract fields from request
     system_message = None
+    user_id = None
+    kafka_profile_id = None
     
     if request:
         system_message = request.system_message
-        if request.user_id:
-            metadata["user_id"] = request.user_id
-        if request.kafka_profile_id:
-            metadata["kafka_profile_id"] = request.kafka_profile_id
-        if request.metadata:
-            metadata.update(request.metadata)
+        user_id = request.user_id
+        kafka_profile_id = request.kafka_profile_id
     
     thread = await thread_db.create_thread(
-        system_message=system_message, 
-        metadata=metadata if metadata else None
+        system_message=system_message,
+        user_id=user_id,
+        kafka_profile_id=kafka_profile_id
     )
     return {"thread_id": thread.get("id"), "created_at": thread.get("created_at")}
 

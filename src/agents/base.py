@@ -36,6 +36,7 @@ async for event in agent.run([Message(role="user", content="Hello")]):
 import json
 import uuid
 import time
+import logging
 from typing import Optional, List, Dict, Any, AsyncGenerator
 
 from typing import TYPE_CHECKING
@@ -44,6 +45,7 @@ from src.llm.base import LLMProvider
 from src.llm.types import Message
 from src.tools.base import ToolProvider
 from src.tools.types import Tool
+from src.llm.context_compaction import ContextCompactionProvider, is_context_length_error
 
 if TYPE_CHECKING:
     from src.prompts.base import PromptProvider
@@ -72,7 +74,9 @@ class Agent:
         tool_provider: ToolProvider,
         system_prompt: Optional[str] = None,
         prompt_provider: Optional["PromptProvider"] = None,
-        max_iterations: int = 50
+        context_compaction_provider: Optional[ContextCompactionProvider] = None,
+        max_iterations: int = 50,
+        logger: Optional[logging.Logger] = None,
     ):
         """
         Initialize the agent.
@@ -84,12 +88,16 @@ class Agent:
             prompt_provider: Optional PromptProvider for system prompt generation.
                            If both system_prompt and prompt_provider are given,
                            system_prompt takes precedence.
+            context_compaction_provider: Optional provider for handling context length errors
             max_iterations: Safety limit for loop iterations
+            logger: Optional logger for debugging
         """
         self.llm_provider = llm_provider
         self.tool_provider = tool_provider
         self.prompt_provider = prompt_provider
+        self.context_compaction_provider = context_compaction_provider
         self.max_iterations = max_iterations
+        self.logger = logger or logging.getLogger(__name__)
         
         # Resolve system prompt: explicit string takes precedence over provider
         if system_prompt is not None:
@@ -120,6 +128,34 @@ class Agent:
             handler=lambda summary="": {"status": "idle", "summary": summary}
         )
         self.tool_provider.add_tool(idle_tool)
+    
+    def _message_to_dict(self, message: Message) -> Dict[str, Any]:
+        """Convert a Message object to a dictionary for compaction."""
+        result: Dict[str, Any] = {"role": message.role}
+        
+        if message.content is not None:
+            result["content"] = message.content
+        
+        if message.tool_calls:
+            result["tool_calls"] = message.tool_calls
+        
+        if message.tool_call_id:
+            result["tool_call_id"] = message.tool_call_id
+        
+        if message.name:
+            result["name"] = message.name
+        
+        return result
+    
+    def _dict_to_message(self, data: Dict[str, Any]) -> Message:
+        """Convert a dictionary back to a Message object."""
+        return Message(
+            role=data.get("role", "user"),
+            content=data.get("content"),
+            tool_calls=data.get("tool_calls"),
+            tool_call_id=data.get("tool_call_id"),
+            name=data.get("name"),
+        )
     
     async def run(
         self,
@@ -168,6 +204,9 @@ class Agent:
         # Get all available tools
         tools = await self.tool_provider.get_tools()
         
+        # Track if we've already attempted context compaction this run
+        context_compaction_attempted = False
+        
         for iteration in range(self.max_iterations):
             # Generate unique IDs for this completion
             completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -178,14 +217,61 @@ class Agent:
             accumulated_tool_calls: Dict[int, Dict[str, Any]] = {}
             finish_reason = None
             
-            # Stream the LLM completion
-            async for chunk in self.llm_provider.stream_completion(
-                working_messages,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                **kwargs
-            ):
+            # Stream the LLM completion with context length error handling
+            try:
+                stream = self.llm_provider.stream_completion(
+                    working_messages,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **kwargs
+                )
+                # We need to iterate through the stream inside the try block
+                # to catch errors that occur during streaming
+                chunks_buffer = []
+                async for chunk in stream:
+                    chunks_buffer.append(chunk)
+            except Exception as e:
+                # Check if this is a context length error
+                if is_context_length_error(e) and not context_compaction_attempted:
+                    if self.context_compaction_provider:
+                        self.logger.info(f"Context length error detected: {e}")
+                        self.logger.info("Initiating context compaction...")
+                        
+                        # Convert messages to dict format for compaction
+                        messages_dict = [self._message_to_dict(m) for m in working_messages]
+                        
+                        try:
+                            compacted_messages = await self.context_compaction_provider.compact(
+                                messages=messages_dict,
+                                system_prompt=self.system_prompt or "",
+                                model=model,
+                            )
+                            
+                            # Convert back to Message objects
+                            working_messages = [self._dict_to_message(m) for m in compacted_messages]
+                            context_compaction_attempted = True
+                            
+                            self.logger.info(
+                                f"Context compaction complete. Messages: {len(messages_dict)} -> {len(working_messages)}"
+                            )
+                            
+                            # Retry this iteration with compacted messages
+                            continue
+                            
+                        except Exception as compact_error:
+                            self.logger.error(f"Context compaction failed: {compact_error}")
+                            # Re-raise the original error
+                            raise e
+                    else:
+                        self.logger.warning("Context length error but no compaction provider configured")
+                        raise
+                else:
+                    # Not a context length error or already attempted compaction
+                    raise
+            
+            # Process the buffered chunks
+            for chunk in chunks_buffer:
                 # Build OpenAI-format chunk
                 delta: Dict[str, Any] = {}
                 
@@ -223,6 +309,10 @@ class Agent:
                         if tc.get("function", {}).get("name"):
                             accumulated_tool_calls[idx]["function"]["name"] = tc["function"]["name"]
                         
+                        # Preserve thought_signature for Gemini (required for multi-turn tool calling)
+                        if tc.get("function", {}).get("thought_signature"):
+                            accumulated_tool_calls[idx]["function"]["thought_signature"] = tc["function"]["thought_signature"]
+                        
                         # Build delta for this tool call
                         tc_delta: Dict[str, Any] = {"index": idx}
                         if tc.get("id"):
@@ -234,6 +324,9 @@ class Agent:
                                 tc_delta["function"]["name"] = tc["function"]["name"]
                             if tc["function"].get("arguments"):
                                 tc_delta["function"]["arguments"] = tc["function"]["arguments"]
+                            # Include thought_signature in delta if present
+                            if tc["function"].get("thought_signature"):
+                                tc_delta["function"]["thought_signature"] = tc["function"]["thought_signature"]
                         
                         delta["tool_calls"].append(tc_delta)
                 

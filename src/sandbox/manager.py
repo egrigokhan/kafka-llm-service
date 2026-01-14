@@ -15,7 +15,7 @@ Supports non-blocking operation:
 
 import os
 import asyncio
-from typing import Any, Dict, Optional, Set, Protocol, TYPE_CHECKING
+from typing import Any, Dict, Optional, Set, Protocol, TYPE_CHECKING, Tuple
 
 from .base import Sandbox
 from .daytona import DaytonaSandbox
@@ -31,6 +31,7 @@ class DBClientProtocol(Protocol):
     async def update_thread_sandbox_id(self, thread_id: str, sandbox_id: str) -> Dict[str, Any]: ...
     async def get_thread_metadata(self, thread_id: str) -> Optional[Dict[str, Any]]: ...
     async def get_thread_config(self, thread_id: str) -> Optional[Dict[str, Any]]: ...
+    async def get_or_create_vm_api_key(self, thread_id: str, user_id: str, kafka_profile_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]: ...
 
 
 class SandboxManager:
@@ -94,7 +95,7 @@ class SandboxManager:
         - thread: user_id, kafka_profile_id
         - kafka_profiles: memory_dsn
         - profiles: openai_pk_virtual_key
-        - vm_api_keys: api_key (vm_api_key)
+        - vm_api_keys: api_key (created/fetched when building claim config)
         
         Args:
             thread_id: Thread ID
@@ -103,7 +104,7 @@ class SandboxManager:
         Returns:
             Dict with 'config' key containing environment variables
         """
-        # Get thread config with related data (kafka_profile, profile, vm_api_key)
+        # Get thread config with related data (kafka_profile, profile)
         thread_config = await self._db.get_thread_config(thread_id)
         
         if thread_config:
@@ -111,7 +112,6 @@ class SandboxManager:
             kafka_profile_id = thread_config.get("kafka_profile_id") or ""
             memory_dsn = thread_config.get("memory_dsn") or ""
             openai_pk_virtual_key = thread_config.get("openai_pk_virtual_key") or ""
-            vm_api_key = thread_config.get("vm_api_key") or ""
         else:
             # Fallback to metadata for local DB or missing data
             thread_data = await self._db.get_thread_metadata(thread_id)
@@ -120,7 +120,14 @@ class SandboxManager:
             kafka_profile_id = metadata.get("kafka_profile_id", "") if metadata else ""
             memory_dsn = ""
             openai_pk_virtual_key = ""
-            vm_api_key = ""
+        
+        # Get or create VM API key (created when making the sandbox)
+        vm_api_key, vm_api_key_id = await self._db.get_or_create_vm_api_key(
+            thread_id, 
+            user_id, 
+            kafka_profile_id
+        )
+        vm_api_key = vm_api_key or ""
         
         # Build notebook environment config
         # Values from DB take precedence, fall back to env vars for local dev
